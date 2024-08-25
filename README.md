@@ -34,7 +34,8 @@ This library is designed to facilitate the generation of certificates using the 
 - [x] Create a new certificate
 - [x] Renew a certificate
 - [x] Revoke a certificate
-- [ ] Get certificate information
+- [ ] Support for wildcard domains
+- [ ] Scheduled certificate renewal
 
 ## 🚀 Tecnologies
 
@@ -42,6 +43,7 @@ The following tools were used in the construction of the project:
 
 - [Node.js](https://nodejs.org/en/)
 - [TypeScript](https://www.typescriptlang.org/)
+- [Node-Forge](https://www.npmjs.com/package/node-forge)
 
 ## 📦 Install
 
@@ -62,44 +64,56 @@ yarn add @geisonjr/certfy
 
 > [!TIP]
 > You can use the `.env` file to set the environment variables.
-> 
-> - `DIRECTORY_PATH`: The path where the certificates will be saved.
+>
+> - `CERTFY_DIR`: The path where the certificates will be saved.
 
 ```bash
-DIRECTORY_PATH=/Users/<username>/certificates
+CERTFY_DIR=/Users/<username>/certificates
 # or
-DIRECTORY_PATH=C:\Users\<username>\certificates
+CERTFY_DIR=C:\Users\<username>\certificates
 # or
-DIRECTORY_PATH=./certificates
+CERTFY_DIR=./certificates
 ```
 
 ### Example
 
 ```typescript
-import { Certfy } from '@geisonjr/certfy';
+import { Certificate } from "@geisonjr/certfy";
 
-const certfy = new Certfy()
+const cert = new Certificate();
 
 // Create a new certificate
-certfy.obtainCertificate({
-  domains: ['example.com', 'www.example.com'],
-  email: [
-    'username@example.com'
-  ]
-})
+await cert.obtain({
+	domains: ["www.example.com", "example.com"],
+	email: ["username@example.com"], // Optional
+});
 
 // Renew a certificate
-certfy.renewCertificate({
-  domains: ['example.com', 'www.example.com'],
-  email: [
-    'username@example.com'
-  ]
-})
-
-const certificate = fs.readFileSync('fullchain.pem')
+await cert.renew({
+	domains: ["www.example.com", "example.com"],
+	email: ["username@example.com"], // Optional
+  force: true, // Optional
+  revoke: true, // Optional
+  reason: REASON.unspecified, // Optional
+});
 
 // Revoke a certificate
-certfy.revokeCertificate(certificate)
+const certificate: string = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----";
+const privateKey: string = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----";
+
+await cert.revoke(certificate, privateKey, {
+  reason: REASON.unspecified, // Optional
+});
+```
+
+#### Can you see a complete example [here](./example/index.ts), to run the example use the following commands:
+
+```bash
+npm run example
+```
+
+```bash
+yarn example
 ```
 
 ## 📚 References

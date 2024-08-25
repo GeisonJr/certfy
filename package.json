@@ -1,6 +1,6 @@
 {
 	"name": "@geisonjr/certfy",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"author": "GeisonJr",
 	"license": "MIT",
 	"description": "Certfy is a simple and easy-to-use library to generate SSL certificates using Let's Encrypt.",
@@ -14,6 +14,7 @@
 	},
 	"scripts": {
 		"build": "npm run script:clean && npm run tsc:build",
+		"example": "ts-node ./example/index.ts",
 		"prepack": "npm run build",
 		"script:clean": "node ./scripts/clean.js",
 		"tsc:build": "tsc -p ./tsconfig.json"

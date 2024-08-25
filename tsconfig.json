@@ -7,8 +7,10 @@
 		"outDir": "./lib",
 		"resolveJsonModule": true,
 		"skipLibCheck": true,
-		"strict": true,
+		"strict": false,
 		"target": "ES6"
 	},
-	"include": ["./src"]
+	"include": [
+		"./src"
+	]
 }
