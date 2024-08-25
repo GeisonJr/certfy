@@ -1,11 +1,10 @@
-import { isBuffer, isNull, isString, isUndefined } from '@geisonjr/typefy'
-import * as forge from 'node-forge'
-import * as crypto from 'node:crypto'
-import * as fs from 'node:fs'
-import * as http from 'node:http'
-import * as path from 'node:path'
+import '@geisonjr/envfy/config'
+import { isNull, isUndefined } from '@geisonjr/typefy'
+import { generateKeyPairSync, X509Certificate } from 'node:crypto'
+import { createServer, Server } from 'node:http'
 
-import { Account, ACMEAccount, Authorization, Challenge, CreateJWS, Directory, Order, Response } from './types'
+import { Account, ACMEAccount, Authorization, Challenge, Directory, ObtainOption, Options, Order, REASON, RenewOptions, Response, RevokeOptions } from './types'
+import { certificateToDER, createCSR, createJWS, deleteFolder, keyObjectToJWK, keyObjectToPEM, newPrivateKey, newPublicKey, readFile, request, thumbprint, writeFile } from './util'
 
 /**
  * Class to create a Certificate
@@ -14,49 +13,86 @@ export class Certificate {
 	private account!: Account
 	private challenges: Record<string, string> = {}
 	private directory!: Directory
+	private _domains: string[] = []
+	private _email: string[] = []
 	private nonce: null | string = null
-	private server!: http.Server
+	private server!: Server
+	private staging: boolean = false
 
-	constructor() { }
+	constructor(options: Options = {}) {
+		const { staging = false } = options
 
-	private async request<T>(url: string, options: RequestInit = {}): Promise<Response<T>> {
-		options.method ??= 'GET'
-		options.headers = new Headers(options.headers)
+		this.staging = staging
+	}
 
-		// Set the content type if it is not set and the method is POST
-		if (options.method === 'POST' && !options.headers.has('Content-Type'))
-			options.headers.set('Content-Type', 'application/jose+json')
+	get domains() {
+		return this._domains
+	}
 
-		// Execute the request
-		const response = await fetch(url, options)
+	set domains(domains: string[]) {
+		// Check if the domains are already set
+		if (this.domains.length)
+			return
 
-		// Check if the response is ok
-		if (!response.ok)
-			throw await response.text()
+		// Check if the domains are not empty
+		if (!domains.length)
+			throw new Error('Domains not found')
 
-		// Get the content type
-		const contentType = response.headers.get('Content-Type') ?? ''
+		// Remove duplicates
+		domains = Array.from(new Set(domains))
 
-		let data: T
+		// Check if the domains are valid
+		const invalidDomains = domains.filter(domain => !(/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]/i).test(domain))
+		if (invalidDomains.length)
+			throw new Error(`Invalid domains (${invalidDomains.join(', ')})`)
 
-		const isApplicationJSON = /application\/([a-zA-Z]+\+)?json/
-		if (isApplicationJSON.test(contentType))
-			data = await response.json() as T
-		else
-			data = await response.text() as T
+		// Check if the domains are wildcards
+		const wildcardDomains = domains.filter(domain => domain.startsWith('*'))
+		if (wildcardDomains.length > 0)
+			throw new Error(`Wildcards are not supported (${wildcardDomains.join(', ')})`)
+
+		this._domains = domains
+	}
+
+	get email() {
+		return this._email
+	}
+
+	set email(email: string[]) {
+		// Check if the email is already set
+		if (this.email.length)
+			return
+
+		// Check if the email is not empty
+		// if (!email.length)
+		// 	throw new Error('Email not found')
+
+		// Remove duplicates
+		email = Array.from(new Set(email))
+
+		// Check if the email is valid
+		for (const e of email)
+			if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]+$/i.test(e))
+				throw new Error(`Invalid email ${e}`)
+
+		this._email = email
+	}
+
+	private async performRequest<T>(url: string, options: RequestInit = {}) {
+
+		const response = await request<T>(url, options)
 
 		// Set the nonce
 		this.nonce = response.headers.get('Replay-Nonce')
 
-		return {
-			data,
-			headers: response.headers
-		}
+		return response
 	}
 
 	private async listenChallenge(): Promise<void> {
+
 		return new Promise((resolve, reject) => {
-			this.server = http.createServer((req, res) => {
+			this.server = createServer((req, res) => {
+
 				if (req.method !== 'GET') {
 					res.writeHead(405)
 					res.end()
@@ -74,9 +110,13 @@ export class Certificate {
 						res.end()
 						return
 					}
+
+					res.writeHead(404)
+					res.end()
+					return
 				}
 
-				res.writeHead(404)
+				res.writeHead(400)
 				res.end()
 			})
 
@@ -90,161 +130,99 @@ export class Certificate {
 		})
 	}
 
-	private toBase64Url(data: object | string): string {
-		if (isBuffer(data))
-			return data.toString('base64url')
+	private async getDirectory(): Promise<Directory> {
 
-		if (isString(data))
-			return Buffer.from(data).toString('base64url')
+		// Return the directory if it is already set
+		if (!isUndefined(this.directory))
+			return this.directory
 
-		return Buffer.from(JSON.stringify(data)).toString('base64url')
+		let api = 'https://acme-v02.api.letsencrypt.org' // Production
+		if (this.staging)
+			api = 'https://acme-staging-v02.api.letsencrypt.org' // Staging
+
+		// Prepare the URL to get the directory
+		const url = new URL('/directory', api).toString()
+
+		// Request the directory
+		const response = await this.performRequest<Directory>(url)
+
+		return this.directory = response.data
 	}
 
-	private createJWK(key: crypto.KeyObject): crypto.JsonWebKey {
-		return key.export({ format: 'jwk' })
-	}
+	private async getNonce(): Promise<string> {
 
-	private createThumbprint(key: crypto.KeyObject): string {
-		const jwk = this.createJWK(key)
-		const jwkString = JSON.stringify({
-			e: jwk.e,
-			kty: jwk.kty,
-			n: jwk.n
-		})
-
-		return this.toBase64Url(this.hash(jwkString))
-	}
-
-	private createPEM(key: crypto.KeyObject | forge.pki.PrivateKey): string {
-
-		if (key instanceof crypto.KeyObject)
-			return key.export({
-				format: 'pem',
-				type: 'pkcs1'
-			}) as string
-
-		return forge.pki.privateKeyToPem(key)
-	}
-
-	private async createJWS(protect: {
-		alg?: 'RS256'
-		jwk?: crypto.JsonWebKey
-		kid?: string
-		nonce?: string
-		url?: string
-	}, payload: object, privateKey: crypto.KeyObject): Promise<CreateJWS> {
-		protect.alg ??= 'RS256'
-		protect.nonce ??= await this.getNonce()
-
-		if (isUndefined(protect.jwk) && isUndefined(protect.kid))
-			throw new Error('Missing "kid" or "jwk" in the protected header')
-
-		const protectBase64 = this.toBase64Url(protect)
-		const payloadBase64 = this.toBase64Url(payload)
-		const signature = this.sign(`${protectBase64}.${payloadBase64}`, privateKey)
-		const signatureBase64 = this.toBase64Url(signature)
-
-		return {
-			protected: protectBase64,
-			payload: payloadBase64,
-			signature: signatureBase64
+		// Return the nonce if it is already set and clear it
+		if (!isNull(this.nonce)) {
+			const nonce = this.nonce
+			this.nonce = null
+			return nonce
 		}
-	}
 
-	private hash(data: string): Buffer {
-		const hash = crypto.createHash('SHA256')
-		hash.update(data)
-		hash.end()
-		return hash.digest()
-	}
-
-	private sign(data: string, privateKey: crypto.KeyObject): Buffer {
-		const sign = crypto.createSign('SHA256')
-		sign.update(data)
-		sign.end()
-		return sign.sign(privateKey)
-	}
-
-	private generateKeyPair(): crypto.KeyPairKeyObjectResult {
-		return crypto.generateKeyPairSync('rsa', {
-			modulusLength: 2048
+		// Request a new nonce
+		const response = await this.performRequest<void>(this.directory.newNonce, {
+			method: 'HEAD'
 		})
+
+		return response.headers.get('Replay-Nonce') as string
 	}
 
-	private generateCSR(domains: string[]) {
-		const clonedDomains = Object.assign(domains) as string[]
+	private async getAccount(createIfNotExists = true): Promise<Account> {
 
-		// Get the common name
-		const commonName = clonedDomains.shift()
+		// Prepare the account file path
+		const data = readFile({
+			filename: 'data.json',
+			folder: 'account'
+		})
 
-		// Get the alternative names
-		const altNames = clonedDomains
+		// Check if the account file exists, if not create a new account
+		if (!data) {
+			if (!createIfNotExists)
+				throw new Error('Account not found')
 
-		const { privateKey, publicKey } = forge.pki.rsa.generateKeyPair({ bits: 2048 })
-		const csr = forge.pki.createCertificationRequest()
+			return this.account = await this.createAccount()
+		}
 
-		csr.publicKey = publicKey
-		csr.setSubject([
-			{
-				name: 'commonName',
-				value: commonName
-			}
-		])
+		// Parse the account data
+		const account = JSON.parse(data) as Account
 
-		// Set the Subject Alternative Name (SAN) extension
-		csr.setAttributes([
-			{
-				name: 'extensionRequest',
-				extensions: [
-					{
-						name: 'subjectAltName',
-						altNames: altNames.map(domain => ({
-							type: 2, // DNS type
-							value: domain
-						}))
-					}
-				]
-			}
-		])
+		// Restore the private key from the file
+		const privateKey = newPrivateKey(account.privateKey as unknown as string)
 
-		csr.sign(privateKey, forge.md.sha256.create())
+		// Restore the public key from the file
+		const publicKey = newPublicKey(account.publicKey as unknown as string)
 
-		const csrInASN1 = forge.pki.certificationRequestToAsn1(csr)
-		const csrInDER = forge.asn1.toDer(csrInASN1).getBytes()
-
-		return {
-			csr: this.toBase64Url(Buffer.from(csrInDER, 'binary')),
+		return this.account = {
+			...account,
 			privateKey,
 			publicKey
 		}
 	}
 
-	private saveFile(filename: string, data: string): void {
-		fs.writeFileSync(path.join(__dirname, filename), data, { encoding: 'utf-8' })
-	}
-
-	private async createAccount(email?: string[]): Promise<Account> {
+	private async createAccount(): Promise<Account> {
 
 		// Generate a new key pair for the account
-		const { privateKey, publicKey } = this.generateKeyPair()
+		const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+			modulusLength: 2048
+		})
 
 		// Prepare the protected header
 		const protect = {
-			jwk: this.createJWK(publicKey),
+			nonce: await this.getNonce(),
+			jwk: keyObjectToJWK(publicKey),
 			url: this.directory.newAccount,
 		}
 
 		// Prepare the payload
 		const payload = {
 			termsOfServiceAgreed: true, // Must be true
-			contact: email?.map((email) => `mailto:${email}`) ?? []
+			contact: this.email.map((email) => `mailto:${email}`)
 		}
 
 		// Encrypt the payload and the protected header into a JWS
-		const jws = await this.createJWS(protect, payload, privateKey)
+		const jws = await createJWS(protect, payload, privateKey)
 
 		// Register the account
-		const response = await this.request<ACMEAccount>(this.directory.newAccount, {
+		const response = await this.performRequest<ACMEAccount>(this.directory.newAccount, {
 			method: 'POST',
 			body: JSON.stringify(jws)
 		})
@@ -253,12 +231,16 @@ export class Certificate {
 		const accountUrl = response.headers.get('Location') || ''
 
 		// Save account data to a file
-		this.saveFile('account.json', JSON.stringify({
-			data: response.data,
-			url: accountUrl,
-			privateKey: this.createPEM(privateKey),
-			publicKey: this.createPEM(publicKey)
-		}))
+		writeFile({
+			filename: 'data.json',
+			folder: 'account',
+			data: JSON.stringify({
+				data: response.data,
+				url: accountUrl,
+				privateKey: keyObjectToPEM(privateKey),
+				publicKey: keyObjectToPEM(publicKey)
+			})
+		})
 
 		return {
 			data: response.data,
@@ -268,75 +250,14 @@ export class Certificate {
 		}
 	}
 
-	private async finalizeOrder(finalizeUrl: string, csr: { csr: string }) {
-		const url = finalizeUrl
-
-		// Prepare the protected header
-		const protect = {
-			kid: this.account.url,
-			url
-		}
-
-		// Prepare the payload
-		const payload = {
-			csr: csr.csr // Certificate Signing Request
-		}
-
-		// Encrypt the payload and the protected header into a JWS
-		const jws = await this.createJWS(protect, payload, this.account.privateKey)
-
-		// Notify the ACME server that the order is ready to be finalized
-		const response = await this.request<Order>(url, {
-			method: 'POST',
-			body: JSON.stringify(jws)
-		})
-
-		return response.headers.get('Location') ?? ''
-	}
-
-	private async getAccount(email?: string[]) {
-		const accountPath = path.join(__dirname, 'account.json')
-
-		// Check if the account file exists, if not create a new account
-		if (!fs.existsSync(accountPath)) {
-			this.account = await this.createAccount(email)
-			return
-		}
-
-		// Read account data from file
-		const data = fs.readFileSync(accountPath, 'utf-8')
-
-		// Parse the account data
-		const account = JSON.parse(data)
-
-		// Restore the private key from the file
-		const privateKey = crypto.createPrivateKey({
-			key: account.privateKey,
-			format: 'pem',
-			type: 'pkcs1'
-		})
-
-		// Restore the public key from the file
-		const publicKey = crypto.createPublicKey({
-			key: account.publicKey,
-			format: 'pem',
-			type: 'pkcs1'
-		})
-
-		this.account = {
-			...account,
-			privateKey,
-			publicKey
-		}
-
-		return
-	}
-
 	private async getAuthorization(authorizationUrl: string) {
-		return await this.request<Authorization>(authorizationUrl)
+
+		return await this.performRequest<Authorization>(authorizationUrl)
 	}
 
 	private async getValidAuthorization(authorizationUrl: string) {
+
+		// Poll the authorization status until it is valid
 		do {
 			const authorization = await this.getAuthorization(authorizationUrl)
 
@@ -355,61 +276,30 @@ export class Certificate {
 		// delete this.challenges[challenge.token]
 	}
 
-	private async getDirectory() {
-		if (!isUndefined(this.directory))
-			return
-
-		// const api = 'https://acme-v02.api.letsencrypt.org' // Production
-		const api = 'https://acme-staging-v02.api.letsencrypt.org' // Staging
-
-		// Prepare the URL to get the directory
-		const url = new URL('/directory', api).toString()
-
-		// Request the directory
-		const response = await this.request<Directory>(url)
-
-		return this.directory = response.data
-	}
-
-	private async getNonce(): Promise<string> {
-		// Return the nonce if it is already set
-		if (!isNull(this.nonce))
-			return this.nonce
-
-		// Request a new nonce
-		const response = await this.request<void>(this.directory.newNonce, {
-			method: 'HEAD'
-		})
-
-		return this.nonce = response.headers.get('Replay-Nonce') as string
-	}
-
-	private async createOrder(domains: string[]): Promise<Response<Order>> {
-		const url = this.directory.newOrder
+	private async createOrder(): Promise<Response<Order>> {
 
 		// Prepare the protected header
 		const protect = {
+			nonce: await this.getNonce(),
 			kid: this.account.url,
-			url
+			url: this.directory.newOrder
 		}
 
 		// Prepare the payload
 		const payload = {
-			identifiers: domains.map((domain) => {
+			identifiers: this.domains.map((domain) => {
 				return {
 					type: 'dns',
 					value: domain
 				}
-			}),
-			// notBefore: new Date().toISOString(),
-			// notAfter: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString() // 90 days
+			})
 		}
 
 		// Encrypt the payload and the protected header into a JWS
-		const jws = await this.createJWS(protect, payload, this.account.privateKey)
+		const jws = await createJWS(protect, payload, this.account.privateKey)
 
 		// Create the order
-		const response = await this.request<Order>(url, {
+		const response = await this.performRequest<Order>(this.directory.newOrder, {
 			method: 'POST',
 			body: JSON.stringify(jws)
 		})
@@ -418,12 +308,16 @@ export class Certificate {
 	}
 
 	private async getValidOrder(orderUrl: string) {
-		do {
-			const order = await this.request<Order>(orderUrl)
 
-			if (order.data.status === 'valid') {
+		// Poll the order status until it is valid
+		do {
+			const order = await this.performRequest<Order>(orderUrl)
+
+			if (order.data.status === 'valid')
 				return order.data.certificate ?? ''
-			}
+
+			if (order.data.status !== 'processing')
+				throw new Error('Order failed ' + JSON.stringify(order.data))
 
 			const timeout = Number(order.headers.get('Retry-After') ?? 5) * 1000
 
@@ -431,8 +325,36 @@ export class Certificate {
 		} while (true)
 	}
 
+	private async finalizeOrder(finalizeUrl: string, csr: string): Promise<string> {
+
+		// Prepare the protected header
+		const protect = {
+			nonce: await this.getNonce(),
+			kid: this.account.url,
+			url: finalizeUrl
+		}
+
+		// Prepare the payload
+		const payload = {
+			csr // Certificate Signing Request
+		}
+
+		// Encrypt the payload and the protected header into a JWS
+		const jws = await createJWS(protect, payload, this.account.privateKey)
+
+		// Notify the ACME server that the order is ready to be finalized
+		const response = await this.performRequest<Order>(finalizeUrl, {
+			method: 'POST',
+			body: JSON.stringify(jws)
+		})
+
+		return response.headers.get('Location') ?? ''
+	}
+
 	private async respondChallenges(challenges: Challenge[]) {
+
 		for (const challenge of challenges) {
+
 			if (challenge.type !== 'http-01')
 				continue
 
@@ -441,12 +363,12 @@ export class Certificate {
 	}
 
 	private async respondChallenge(challenge: Challenge) {
-		const url = challenge.url
 
 		// Prepare the protected header
 		const protect = {
+			nonce: await this.getNonce(),
 			kid: this.account.url,
-			url
+			url: challenge.url
 		}
 
 		// Prepare the payload
@@ -455,74 +377,121 @@ export class Certificate {
 		}
 
 		// Encrypt the payload and the protected header into a JWS
-		const jws = await this.createJWS(protect, payload, this.account.privateKey)
+		const jws = await createJWS(protect, payload, this.account.privateKey)
 
 		// Notify the ACME server that the challenge is ready to be validated
-		await this.request<Challenge>(url, {
+		await this.performRequest<Challenge>(challenge.url, {
 			method: 'POST',
 			body: JSON.stringify(jws)
 		})
 	}
 
 	private storeChallenges(authorizations: Authorization[]) {
+
 		for (const authorization of authorizations) {
 			this.storeChallenge(authorization)
 		}
 	}
 
 	private storeChallenge(authorization: Authorization) {
+
 		const challenges = authorization.challenges
 
 		if (!challenges.length)
 			throw new Error('Challenges not found')
 
 		// Create the JWK thumbprint
-		const thumbprint = this.createThumbprint(this.account.publicKey)
+		const fingerprint = thumbprint(this.account.publicKey)
 
 		for (const challenge of challenges) {
 			// Register the token and key authorization
-			this.challenges[challenge.token] = `${challenge.token}.${thumbprint}`
+			this.challenges[challenge.token] = `${challenge.token}.${fingerprint}`
 		}
 	}
 
 	private async getCertificate(certificateUrl: string) {
-		return (await this.request<string>(certificateUrl)).data
+		return (await this.performRequest<string>(certificateUrl)).data
 	}
 
-	private saveCertificate(certificate: string, privateKey: forge.pki.PrivateKey) {
+	private saveCertificate(certificate: string, privateKey: string) {
+
+		// Get the fullchain
 		const fullchain = certificate
 
 		// Extract the individual certificates
 		const [cert, ...chainParts] = fullchain.split(/(?=-----BEGIN CERTIFICATE-----)/)
 		const chain = chainParts.join('')
 
-		// Save the (cert.pem)
-		this.saveFile('cert.pem', cert.trim() + '\n')
 
-		// Save the (chain.pem)
-		this.saveFile('chain.pem', chain.trim() + '\n')
+		// Move the old certificate to a new folder
+		const files = ['cert.pem', 'chain.pem', 'fullchain.pem', 'privkey.pem']
 
-		// Save the (fullchain.pem)
-		this.saveFile('fullchain.pem', fullchain.trim() + '\n')
+		const now = new Date().getTime()
+		const oldCertificateFolder = this.domains[0] + '-' + now
 
-		// Save the (privkey.pem)
-		const privkey = this.createPEM(privateKey)
-		this.saveFile('privkey.pem', privkey)
+		for (const filename of files) {
+			const data = readFile({
+				filename: filename,
+				folder: this.domains[0]
+			})
+
+			if (data)
+				writeFile({
+					filename: filename,
+					folder: oldCertificateFolder,
+					data
+				})
+		}
+
+		// Save the new files to the domain folder
+		const folder = this.domains[0]
+
+		writeFile({
+			filename: 'cert.pem',
+			folder,
+			data: cert.trim() + '\n'
+		})
+
+		writeFile({
+			filename: 'chain.pem',
+			folder,
+			data: chain.trim() + '\n'
+		})
+
+		writeFile({
+			filename: 'fullchain.pem',
+			folder,
+			data: fullchain.trim() + '\n'
+		})
+
+		writeFile({
+			filename: 'privkey.pem',
+			folder,
+			data: privateKey
+		})
+
+		return oldCertificateFolder
 	}
 
-	public async obtainCertificate({
-		domains,
-		email
-	}: {
-		domains: string[]
-		email?: string[]
-	}) {
+	public async obtain(options: ObtainOption) {
 
+		const {
+			domains = [],
+			email = []
+		} = options
+
+		// Set the domains
+		this.domains = domains
+		this.email = email
+
+		// Get the directory
 		await this.getDirectory()
-		await this.getAccount(email)
+
+		// Get the account or create a new one
+		await this.getAccount()
 
 		// Create a new order
-		const order = await this.createOrder(domains)
+		const order = await this.createOrder()
 
 		// Get the authorizations
 		const authorizationsPromises = order.data.authorizations.map((url) => this.getAuthorization(url))
@@ -531,24 +500,33 @@ export class Certificate {
 		// Prepare the challenges
 		this.storeChallenges(authorizations.map(authorization => authorization.data))
 
-		// Start the HTTP server to listen for challenges
-		await this.listenChallenge()
+		try {
 
-		// Notify the ACME server that the challenges are ready to be validated
-		const challengesPromises = authorizations.map(authorization => this.respondChallenges(authorization.data.challenges))
-		await Promise.all(challengesPromises)
+			// Start the HTTP server to listen for challenges
+			await this.listenChallenge()
 
-		// Await the challenge be validated
-		const validAuthorizationsPromises = order.data.authorizations.map(url => this.getValidAuthorization(url))
-		await Promise.all(validAuthorizationsPromises)
+			// Notify the ACME server that the challenges are ready to be validated
+			const challengesPromises = authorizations.map(authorization => this.respondChallenges(authorization.data.challenges))
+			await Promise.all(challengesPromises)
 
-		// Stop server
-		this.server.close()
+			// Await the challenge be validated
+			const validAuthorizationsPromises = order.data.authorizations.map(url => this.getValidAuthorization(url))
+			await Promise.all(validAuthorizationsPromises)
+
+		} finally {
+			// Stop server
+			if (!isNull(this.server))
+				this.server.close()
+		}
 
 		// Generate a CSR
-		const csr = this.generateCSR(domains)
+		const csr = createCSR({
+			commonName: this.domains[0],
+			subjectAltNames: this.domains.slice(1)
+		})
 
-		const orderUrl = await this.finalizeOrder(order.data.finalize, csr)
+		// Finalize the order
+		const orderUrl = await this.finalizeOrder(order.data.finalize, csr.csr)
 
 		// Await the certificate be issued
 		const certificateUrl = await this.getValidOrder(orderUrl)
@@ -557,44 +535,96 @@ export class Certificate {
 		const certificate = await this.getCertificate(certificateUrl)
 
 		// Save the certificate to a file
-		this.saveCertificate(certificate, csr.privateKey)
+		return this.saveCertificate(certificate, csr.privateKey)
 	}
 
-	public async renewCertificate({
-		domains,
-		email
-	}: {
-		domains: string[]
-		email?: string[]
-	}) {
-		await this.obtainCertificate({
-			domains,
-			email
-		})
+	/**
+	 * Renew a certificate, if the certificate is not expired, it will be revoked and a new one will be obtained
+	 */
+	public async renew(options: RenewOptions) {
+
+		const {
+			domains = [],
+			email = [],
+			force = false,
+			revoke = false,
+			reason = REASON.unspecified
+		} = options
+
+		// Set the domains
+		this.domains = domains
+		this.email = email
+
+		// Check if the certificate is expired
+		const certObject = new X509Certificate(readFile({
+			filename: 'cert.pem',
+			folder: this.domains[0]
+		}))
+
+		const now = new Date().getTime()
+		const notAfter = new Date(certObject.validTo).getTime()
+
+		if (!force && now < notAfter)
+			throw new Error('Certificate is not expired')
+
+		// Obtain a new certificate
+		const oldCertificateFolder = await this.obtain({ domains, email })
+
+		// Revoke the certificate
+		if (revoke) {
+			await this.revoke(
+				readFile({
+					filename: 'cert.pem',
+					folder: oldCertificateFolder
+				}),
+				readFile({
+					filename: 'privkey.pem',
+					folder: oldCertificateFolder
+				}),
+				{
+					reason
+				})
+
+			// Delete the old certificate folder
+			deleteFolder({
+				folder: oldCertificateFolder
+			})
+		}
 	}
 
-	public async revokeIssuedCertificate(cert: string) {
+	/**
+	 * Revoke a certificate, the certificate must be in the same folder as the domain
+	 */
+	public async revoke(certificate: string, privateKey: string, options: RevokeOptions = {}) {
 
+		const {
+			reason = REASON.unspecified
+		} = options
+
+		// Read the certificate file
+		const certObject = new X509Certificate(certificate)
+
+		// Get the directory
 		await this.getDirectory()
-		await this.getAccount()
 
 		// Prepare the protected header
 		const protect = {
-			kid: this.account.url,
+			nonce: await this.getNonce(),
+			jwk: keyObjectToJWK(certObject.publicKey),
 			url: this.directory.revokeCert,
 		}
 
 		// Prepare the payload
 		const payload = {
-			certificate: cert, // Base64 encoded
-			reason: 0, // Unspecified
+			certificate: certificateToDER(certificate), // Base64 encoded
+			reason
 		}
 
 		// Encrypt the payload and the protected header into a JWS
-		const jws = await this.createJWS(protect, payload, this.account.privateKey)
+		const jws = await createJWS(protect, payload, privateKey)
 
 		// Revoke the certificate
-		await this.request(this.directory.revokeCert, {
+		await this.performRequest(this.directory.revokeCert, {
 			method: 'POST',
 			body: JSON.stringify(jws)
 		})
